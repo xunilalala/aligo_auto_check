@@ -45,8 +45,7 @@ def update_secret(name: str, value: str) -> NoReturn:
     token = environ['GP_TOKEN']
 
     if not token:
-        logging.error('未配置 GP_TOKEN, 更新 refresh_tokens 失败')
-        return
+        raise ValueError('未配置 GP_TOKEN')
 
     key, key_id = get_pub_key(repos, token)
 

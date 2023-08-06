@@ -1,10 +1,11 @@
 """
     @Author: ImYrS Yang
-    @Date: 2023/2/12
+    @Date: 2023/3/31
     @Copyright: ImYrS Yang
     @Description: 
 """
 
+from typing import Optional
 import logging
 
 import requests
@@ -13,9 +14,15 @@ from configobj import ConfigObj
 
 class Pusher:
 
-    def __init__(self, endpoint: str, push_key: str):
+    def __init__(
+            self,
+            endpoint: str,
+            user_id: str,
+            access_token: Optional[str] = None,
+    ):
         self.endpoint = endpoint
-        self.push_key = push_key
+        self.user_id = user_id
+        self.access_token = access_token
 
     def send(self, title: str, content: str) -> dict:
         """
@@ -25,14 +32,14 @@ class Pusher:
         :param content: 消息内容
         :return:
         """
-        request = requests.post(
-            self.endpoint + '/message/push',
-            json={
-                'pushkey': self.push_key,
-                'type': 'markdown',
-                'text': title,
-                'desp': content,
-            }
+        request = requests.get(
+            self.endpoint + '/send_private_msg',
+            params={
+                'user_id': self.user_id,
+                'message': f'{title}\n\n{content}',
+                'access_token': self.access_token,
+            },
+            timeout=10,
         )
 
         request.raise_for_status()
@@ -56,18 +63,18 @@ def push(
     :return:
     """
     if (
-            not config['pushdeer_endpoint']
-            or not config['pushdeer_send_key']
+            not config['cqhttp_endpoint']
+            or not config['cqhttp_user_id']
     ):
-        logging.error('PushDeer 推送参数配置不完整')
+        logging.error('go-cqhttp 推送参数配置不完整')
         return False
 
     try:
-        pusher = Pusher(config['pushdeer_endpoint'], config['pushdeer_send_key'])
+        pusher = Pusher(config['cqhttp_endpoint'], config['cqhttp_user_id'], config['cqhttp_access_token'])
         pusher.send(title, content)
-        logging.info('PushDeer 推送成功')
+        logging.info('go-cqhttp 推送成功')
     except Exception as e:
-        logging.error(f'PushDeer 推送失败, 错误信息: {e}')
+        logging.error(f'go-cqhttp 推送失败, 错误信息: {e}')
         return False
 
     return True

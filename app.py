@@ -7,14 +7,15 @@
 
 import logging
 from os import environ
-from sys import argv
 from typing import NoReturn, Optional
 import json
+import argparse
+import time
 
 from configobj import ConfigObj
 import requests
 
-from modules import dingtalk, serverchan, pushdeer, telegram, pushplus, smtp
+from modules import cqhttp, dingtalk, feishu, pushdeer, pushplus, serverchan, smtp, telegram, webhook
 import github
 
 
@@ -27,12 +28,14 @@ class SignIn:
             self,
             config: ConfigObj | dict,
             refresh_token: str,
+            do_not_reward: Optional[bool] = False,
     ):
         """
         初始化
 
         :param config: 配置文件, ConfigObj 对象或字典
         :param refresh_token: refresh_token
+        :param do_not_reward: 是否不领取奖励
         """
         self.config = config
         self.refresh_token = refresh_token
@@ -43,6 +46,7 @@ class SignIn:
         self.signin_count = 0
         self.signin_reward = None
         self.error = None
+        self.do_not_reward = do_not_reward
 
     def __hide_refresh_token(self) -> str:
         """
@@ -55,19 +59,29 @@ class SignIn:
         except IndexError:
             return self.refresh_token
 
-    def __get_access_token(self) -> bool:
+    def __get_access_token(self, retry: bool = False) -> bool:
         """
         获取 access_token
 
+        :param retry: 是否重试
         :return: 是否成功
         """
-        data = requests.post(
-            'https://auth.aliyundrive.com/v2/account/token',
-            json={
-                'grant_type': 'refresh_token',
-                'refresh_token': self.refresh_token,
-            }
-        ).json()
+        try:
+            data = requests.post(
+                'https://auth.aliyundrive.com/v2/account/token',
+                json={
+                    'grant_type': 'refresh_token',
+                    'refresh_token': self.refresh_token,
+                }
+            ).json()
+        except requests.RequestException as e:
+            logging.error(f'[{self.hide_refresh_token}] 获取 access token 请求失败: {e}')
+            if not retry:
+                logging.info(f'[{self.hide_refresh_token}] 正在重试...')
+                return self.__get_access_token(retry=True)
+
+            self.error = e
+            return False
 
         try:
             if data['code'] in [
@@ -79,48 +93,110 @@ class SignIn:
         except KeyError:
             pass
 
-        self.access_token = data['access_token']
-        self.new_refresh_token = data['refresh_token']
-        self.phone = data['user_name']
+        try:
+            self.access_token = data['access_token']
+            self.new_refresh_token = data['refresh_token']
+            self.phone = data['user_name']
+        except KeyError:
+            logging.error(f'[{self.hide_refresh_token}] 获取 access token 失败, 参数缺失: {data}')
+            self.error = f'获取 access token 失败, 参数缺失: {data}'
+            return False
 
         return True
 
-    def __sign_in(self) -> NoReturn:
+    def __sign_in(self, retry: bool = False) -> NoReturn:
         """
         签到函数
 
         :return:
         """
-        data = requests.post(
-            'https://member.aliyundrive.com/v1/activity/sign_in_list',
-            headers={
-                'Authorization': f'Bearer {self.access_token}',
-            },
-            json={},
-        ).json()
+        try:
+            data = requests.post(
+                'https://member.aliyundrive.com/v1/activity/sign_in_list',
+                params={'_rx-s': 'mobile'},
+                headers={'Authorization': f'Bearer {self.access_token}'},
+                json={'isReward': False},
+            ).json()
+            logging.debug(str(data))
+        except requests.RequestException as e:
+            logging.error(f'[{self.phone}] 签到请求失败: {e}')
+            if not retry:
+                logging.info(f'[{self.phone}] 正在重试...')
+                return self.__sign_in(retry=True)
+
+            self.error = e
+            return
+
+        if data['code'] == 'AccessTokenInvalid':
+            logging.error(f'[{self.phone}] access token 无效, 正在重新获取...')
+            if not retry:
+                logging.info(f'[{self.phone}] 签到失败, 正在重试...')
+                return self.__sign_in(retry=True)
 
         if 'success' not in data:
             logging.error(f'[{self.phone}] 签到失败, 错误信息: {data}')
             self.error = data
             return
 
-        current_day = None
-        for i, day in enumerate(data['result']['signInLogs']):
-            if day['status'] == 'miss':
-                current_day = data['result']['signInLogs'][i - 1]
-                break
+        self.signin_count = data['result']['signInCount']
+
+        if self.do_not_reward:
+            if self.signin_count < len(data['result']['signInLogs']):
+                logging.info(f'[{self.phone}] 已设置不领取奖励.')
+                self.signin_reward = '跳过领取奖励'
+                return
+
+            self.__reward_all(len(data['result']['signInLogs']))
+            return
+
+        try:
+            data = requests.post(
+                'https://member.aliyundrive.com/v1/activity/sign_in_reward',
+                params={'_rx-s': 'mobile'},
+                headers={'Authorization': f'Bearer {self.access_token}'},
+                json={'signInDay': self.signin_count},
+            ).json()
+            logging.debug(str(data))
+        except requests.RequestException as e:
+            logging.error(f'[{self.phone}] 兑换请求失败: {e}')
+            if not retry:
+                logging.info(f'[{self.phone}] 正在重试...')
+                return self.__sign_in(retry=True)
 
         reward = (
             '无奖励'
-            if not current_day['isReward']
-            else f'获得 {current_day["reward"]["name"]} {current_day["reward"]["description"]}'
+            if not data['result']
+            else f'获得 {data["result"]["name"]} {data["result"]["description"]}'
         )
 
-        self.signin_count = data['result']['signInCount']
         self.signin_reward = reward
 
         logging.info(f'[{self.phone}] 签到成功, 本月累计签到 {self.signin_count} 天.')
         logging.info(f'[{self.phone}] 本次签到{reward}')
+
+    def __reward_all(self, max_day: int) -> NoReturn:
+        """
+        兑换当月全部奖励
+
+        :param max_day: 最大天数
+        :return:
+        """
+        url = 'https://member.aliyundrive.com/v1/activity/sign_in_reward'
+        params = {'_rx-s': 'mobile'}
+        headers = {'Authorization': f'Bearer {self.access_token}'}
+
+        for day in range(1, max_day + 1):
+            try:
+                requests.post(
+                    url,
+                    params=params,
+                    headers=headers,
+                    json={'signInDay': day},
+                )
+            except requests.RequestException as e:
+                logging.error(f'[{self.phone}] 签到请求失败: {e}')
+
+        self.signin_reward = '已自动领取本月全部奖励'
 
     def __generate_result(self) -> dict:
         """
@@ -131,16 +207,16 @@ class SignIn:
         user = self.phone or self.hide_refresh_token
         text = (
             f'[{user}] 签到成功, 本月累计签到 {self.signin_count} 天.\n本次签到{self.signin_reward}'
-            if self.signin_count
-            else f'[{user}] 签到失败\n{json.dumps(self.error, indent=2, ensure_ascii=False)}'
+            if not self.error
+            else f'[{user}] 签到失败\n{json.dumps(str(self.error), indent=2, ensure_ascii=False)}'
         )
 
         text_html = (
             f'<code>{user}</code> 签到成功, 本月累计签到 {self.signin_count} 天.\n本次签到{self.signin_reward}'
-            if self.signin_count
+            if not self.error
             else (
                 f'<code>{user}</code> 签到失败\n'
-                f'<code>{json.dumps(self.error, indent=2, ensure_ascii=False)}</code>'
+                f'<code>{json.dumps(str(self.error), indent=2, ensure_ascii=False)}</code>'
             )
         )
 
@@ -163,6 +239,7 @@ class SignIn:
         result = self.__get_access_token()
 
         if result:
+            time.sleep(3)
             self.__sign_in()
 
         return self.__generate_result()
@@ -194,39 +271,42 @@ def push(
     ]
 
     for push_type, pusher in {
+        'go-cqhttp': cqhttp,
         'dingtalk': dingtalk,
-        'serverchan': serverchan,
+        'feishu': feishu,
         'pushdeer': pushdeer,
-        'telegram': telegram,
         'pushplus': pushplus,
+        'serverchan': serverchan,
         'smtp': smtp,
+        'telegram': telegram,
+        'webhook': webhook,
     }.items():
         if push_type in configured_push_types:
             pusher.push(config, content, content_html, title)
 
 
-def init_logger() -> NoReturn:
+def init_logger(debug: Optional[bool] = False) -> NoReturn:
     """
     初始化日志系统
 
     :return:
     """
     log = logging.getLogger()
-    log.setLevel(logging.INFO)
+    log.setLevel(logging.DEBUG)
     log_format = logging.Formatter(
         '%(asctime)s - %(filename)s:%(lineno)d - %(levelname)s: %(message)s'
     )
 
     # Console
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
+    log.setLevel(logging.DEBUG if debug else logging.INFO)
     ch.setFormatter(log_format)
     log.addHandler(ch)
 
     # Log file
     log_name = 'aliyun_auto_signin.log'
     fh = logging.FileHandler(log_name, mode='a', encoding='utf-8')
-    fh.setLevel(logging.DEBUG)
+    log.setLevel(logging.DEBUG if debug else logging.INFO)
     fh.setFormatter(log_format)
     log.addHandler(fh)
 
@@ -238,23 +318,19 @@ def get_config_from_env() -> Optional[dict]:
     :return: 配置字典, 配置缺失返回 None
     """
     try:
+        refresh_tokens = environ['REFRESH_TOKENS'] or ''
+        push_types = environ['PUSH_TYPES'] or ''
+
         return {
-            'refresh_tokens': (
-                [environ['REFRESH_TOKENS']]
-                if not environ['REFRESH_TOKENS']
-                else environ['REFRESH_TOKENS'].split(',')
-            ),
-            'push_types': (
-                [environ['PUSH_TYPES']]
-                if not environ['PUSH_TYPES']
-                else environ['PUSH_TYPES'].split(',')
-            ),
+            'refresh_tokens': refresh_tokens.split(','),
+            'push_types': push_types.split(','),
             'serverchan_send_key': environ['SERVERCHAN_SEND_KEY'],
             'telegram_endpoint': 'https://api.telegram.org',
             'telegram_bot_token': environ['TELEGRAM_BOT_TOKEN'],
             'telegram_chat_id': environ['TELEGRAM_CHAT_ID'],
             'telegram_proxy': None,
             'pushplus_token': environ['PUSHPLUS_TOKEN'],
+            'pushplus_topic': environ['PUSHPLUS_TOPIC'],
             'smtp_host': environ['SMTP_HOST'],
             'smtp_port': environ['SMTP_PORT'],
             'smtp_tls': environ['SMTP_TLS'],
@@ -262,10 +338,30 @@ def get_config_from_env() -> Optional[dict]:
             'smtp_password': environ['SMTP_PASSWORD'],
             'smtp_sender': environ['SMTP_SENDER'],
             'smtp_receiver': environ['SMTP_RECEIVER'],
+            'feishu_webhook': environ['FEISHU_WEBHOOK'],
+            'webhook_url': environ['WEBHOOK_URL'],
+            'cqhttp_endpoint': environ['CQHTTP_ENDPOINT'],
+            'cqhttp_user_id': environ['CQHTTP_USER_ID'],
+            'cqhttp_access_token': environ['CQHTTP_ACCESS_TOKEN'],
         }
     except KeyError as e:
         logging.error(f'环境变量 {e} 缺失.')
         return None
+
+
+def get_args() -> argparse.Namespace:
+    """
+    获取命令行参数
+
+    :return: 命令行参数
+    """
+    parser = argparse.ArgumentParser(description='阿里云盘自动签到 by @ImYrS')
+
+    parser.add_argument('-a', '--action', help='由 GitHub Actions 调用', action='store_true', default=False)
+    parser.add_argument('-d', '--debug', help='调试模式, 会输出更多调试数据', action='store_true', default=False)
+    parser.add_argument('--do-not-reward', help='仅签到, 不进行奖励兑换', action='store_true', default=False)
+
+    return parser.parse_args()
 
 
 def main():
@@ -276,24 +372,20 @@ def main():
     """
     environ['NO_PROXY'] = '*'  # 禁止代理
 
-    init_logger()  # 初始化日志系统
+    args = get_args()
 
-    by_action = (
-        True
-        if len(argv) == 2 and argv[1] == 'action'
-        else False
-    )
+    init_logger(args.debug)  # 初始化日志系统
 
     # 获取配置
     config = (
         get_config_from_env()
-        if by_action
+        if args.action
         else ConfigObj('config.ini', encoding='UTF8')
     )
 
     if not config:
         logging.error('获取配置失败.')
-        return
+        raise ValueError('获取配置失败.')
 
     # 获取所有 refresh token 指向用户
     users = (
@@ -303,29 +395,68 @@ def main():
     )
 
     results = []
+    do_not_reward = (
+        environ['DO_NOT_REWARD'] == 'true'
+        if args.action
+        else
+        args.do_not_reward
+    )
 
     for user in users:
-        result = SignIn(config=config, refresh_token=user).run()
-        results.append(result)
+        signin = SignIn(
+            config=config,
+            refresh_token=user,
+            do_not_reward=do_not_reward,
+        )
+
+        results.append(signin.run())
 
     # 合并推送
     text = '\n\n'.join([i['text'] for i in results])
     text_html = '\n\n'.join([i['text_html'] for i in results])
+
+    if args.action and not environ['GP_TOKEN']:
+        text += (
+            '\n\n当前 Actions 尚未配置 GP_TOKEN, 请参考 '
+            'https://imyrs.cn/posts/2023/auto-signin-aliyundrive-by-using-github-action/#github-personal-token'
+            ' 尽快处理.'
+        )
+        text_html += (
+            '\n\n当前 Actions 尚未配置 GP_TOKEN, 请参考 '
+            'https://imyrs.cn/posts/2023/auto-signin-aliyundrive-by-using-github-action/#github-personal-token'
+            ' 尽快处理.'
+        )
+
+    new_platform = (
+        '\n\n[通知] 新一代签到平台发布!\n\n'
+        '经过一个月的测试, 现在向你推荐由原班人马开发的新阿里云盘签到平台!\n\n'
+        '官网: https://aliyundrive.pro\n\n'
+        '- 免费, 快速, 可视化, 高可用性\n'
+        '- 支持最新版签到任务, 可自动完成上传文件, 观看视频等任务\n'
+        '- 每天推送太吵了? 支持仅签到失败时才推送\n'
+        '- 可同时绑定多个账号, 分别配置签到参数, 可视化配置更轻松\n'
+        '- 每天定时签到怕风控? 可以配置每天随机事件签到!\n'
+        '- 每周自动参加战队 PK, 帮你领取补签卡\n'
+        '- 害怕隐私风险? 可在登陆页面查看完整的隐私条款, 个人隐私是底线!\n\n'
+        '更多问题请在 GitHub issue 中提出, 或加入交流群 https://t.me/aliyun_auto_signin'
+    )
+
+    text += new_platform
+    text_html += new_platform
 
     push(config, text, text_html, '阿里云盘签到')
 
     # 更新 refresh token
     new_users = [i['refresh_token'] for i in results]
 
-    if not by_action:
+    if not args.action:
         config['refresh_tokens'] = ','.join(new_users)
     else:
         try:
             github.update_secret('REFRESH_TOKENS', ','.join(new_users))
+            logging.info('refresh tokens 更新成功.')
         except Exception as e:
-            err = f'Action 更新 Github Secrets 失败: {e}'
-            logging.error(err)
-            push(config, err, err, '阿里云盘签到')
+            logging.error(f'更新 refresh tokens 失败: {e}')
 
 
 if __name__ == '__main__':

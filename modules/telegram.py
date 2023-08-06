@@ -26,7 +26,7 @@ class Pusher:
         self.chat_id = chat_id
         self.proxy = proxy
 
-    def send(self, title: str, content: str) -> Optional[dict]:
+    def send(self, title: str, content: str) -> dict:
         """
         发送消息
 
@@ -34,7 +34,7 @@ class Pusher:
         :param content: 消息内容
         :return:
         """
-        resp = requests.post(
+        request = requests.post(
             self.endpoint + f'/bot{self.token}/sendMessage',
             json={
                 'chat_id': self.chat_id,
@@ -48,11 +48,9 @@ class Pusher:
             timeout=10,
         )
 
-        if resp.status_code == 200:
-            return resp.json()
+        request.raise_for_status()
 
-        logging.error(f'Telegram 推送失败: {resp.status_code} {resp.text}')
-        return None
+        return request.json()
 
 
 def push(
@@ -85,8 +83,8 @@ def push(
             config['telegram_chat_id'],
             config['telegram_proxy'],
         )
-        if pusher.send(title, content_html):
-            logging.info('Telegram 推送成功')
+        pusher.send(title, content_html)
+        logging.info('Telegram 推送成功')
     except Exception as e:
         logging.error(f'Telegram 推送失败, 错误信息: {e}')
         return False

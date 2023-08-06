@@ -16,9 +16,19 @@ class Pusher:
         :param content: 消息内容
         :return:
         """
-        api = "https://sc.ftqq.com/%s.send" % self.send_key
-        data = {"text": title, "desp": content}
-        return requests.post(api, data=data).json()
+        url = 'https://sc.ftqq.com/%s.send' % self.send_key
+
+        request = requests.post(
+            url,
+            data={
+                'text': title,
+                'desp': content,
+            }
+        )
+
+        request.raise_for_status()
+
+        return request.json()
 
 
 def push(

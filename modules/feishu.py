@@ -1,6 +1,6 @@
 """
     @Author: ImYrS Yang
-    @Date: 2023/2/12
+    @Date: 2023/3/16
     @Copyright: ImYrS Yang
     @Description: 
 """
@@ -12,10 +12,8 @@ from configobj import ConfigObj
 
 
 class Pusher:
-
-    def __init__(self, endpoint: str, push_key: str):
-        self.endpoint = endpoint
-        self.push_key = push_key
+    def __init__(self, webhook: str):
+        self.webhook = webhook
 
     def send(self, title: str, content: str) -> dict:
         """
@@ -26,12 +24,22 @@ class Pusher:
         :return:
         """
         request = requests.post(
-            self.endpoint + '/message/push',
+            self.webhook,
             json={
-                'pushkey': self.push_key,
-                'type': 'markdown',
-                'text': title,
-                'desp': content,
+                'msg_type': 'post',
+                'content': {
+                    'post': {
+                        'zh_cn': {
+                            'title': title,
+                            'content': [
+                                [{
+                                    'tag': 'text',
+                                    'text': content
+                                }]
+                            ]
+                        },
+                    }
+                }
             }
         )
 
@@ -55,19 +63,16 @@ def push(
     :param title: 标题
     :return:
     """
-    if (
-            not config['pushdeer_endpoint']
-            or not config['pushdeer_send_key']
-    ):
-        logging.error('PushDeer 推送参数配置不完整')
+    if not config['feishu_webhook']:
+        logging.error('飞书 推送参数配置不完整')
         return False
 
     try:
-        pusher = Pusher(config['pushdeer_endpoint'], config['pushdeer_send_key'])
+        pusher = Pusher(config['feishu_webhook'])
         pusher.send(title, content)
-        logging.info('PushDeer 推送成功')
+        logging.info('飞书 推送成功')
     except Exception as e:
-        logging.error(f'PushDeer 推送失败, 错误信息: {e}')
+        logging.error(f'飞书 推送失败, 错误信息: {e}')
         return False
 
     return True

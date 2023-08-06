@@ -41,7 +41,7 @@ class Pusher:
         :param content: 消息内容
         :return:
         """
-        return requests.post(
+        request = requests.post(
             'https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend',
             headers={
                 'x-acs-dingtalk-access-token': self.access_token,
@@ -54,7 +54,11 @@ class Pusher:
                     'content': content,
                 })
             }
-        ).json()
+        )
+
+        request.raise_for_status()
+
+        return request.json()
 
 
 def push(
